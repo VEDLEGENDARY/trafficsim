@@ -1,7 +1,6 @@
 """
-Circle Road Traffic Flow Optimization - Final V5 (Numba + Multiprocessing)
-Uses Numba JIT compilation for speed, simulates realistic traffic with reaction delays.
-The inducer fluctuates 0.9x-1.2x, learners must learn distance/speed to prevent cascading slowdowns.
+Circle Road Traffic Flow Optimization - Simplified V6
+Learns to maintain smooth speed and safe following distance.
 """
 import numpy as np
 import os
@@ -14,224 +13,236 @@ import time as timer
 
 # =============================================================================
 # CONFIGURATION
+CAR_SIZE_RATIO = 1.0  # Ratio to scale car size (1.0 = default, <1 smaller, >1 larger)
 # =============================================================================
-NUM_CARS = 10  # 1 inducer + 9 learners
-CIRCLE_RADIUS = 100.0
+NUM_CARS = 15
+CIRCLE_RADIUS = 50.0
 CIRCUMFERENCE = 2 * np.pi * CIRCLE_RADIUS
-BASE_SPEED = 10.0  # m/s (~36 km/h)
-SIM_DURATION = 180.0
+BASE_SPEED = 10.0  # m/s
+SIM_DURATION = 300.0
 DT = 0.05
-SAMPLES_PER_GEN = 100
-NUM_GENERATIONS = 50  # Full run
-SAVE_DIR = "gen_results_v5"
-MIN_SAFE_DISTANCE = 4.0  # meters
-MAX_WORKERS = min(8, max(1, os.cpu_count() - 2))  # Cap at 8 to prevent memory issues
+SAMPLES_PER_GEN = 20
+NUM_GENERATIONS = 50
+SAVE_DIR = "gen_results_v6"
+MAX_WORKERS = min(8, max(1, os.cpu_count() - 2))
 
-# Physics
-ACCEL_RATE = 2.5  # m/s^2
-DECEL_RATE = 4.0  # m/s^2
-REACTION_DELAY = 1.0  # 1 second delay before can accelerate after front car speeds up
+# Neural network: 3 inputs -> 1 output (just target speed)
+GENOME_SIZE = 4  # 3 weights + 1 bias
 
-# Neural network: simple linear weights for speed/distance decisions
-# Inputs: gap_ratio, front_speed_ratio, own_speed_ratio (3)
-# Outputs: target_speed_mult, preferred_gap (2)
-INPUT_SIZE = 3
-OUTPUT_SIZE = 2
-GENOME_SIZE = 8  # 6 weights + 2 biases
-
-# Car array indices (for Numba)
+# Car state indices
 C_ANGLE = 0
 C_SPEED = 1
-C_TARGET_SPEED = 2
-C_SPEED_MULT = 3
-C_DISTANCE = 4  # total distance traveled
-C_IS_INDUCER = 5
-C_ACCEL_TIMER = 6  # reaction delay timer
-C_PENDING_ACCEL = 7
-CAR_FIELDS = 8
+C_DISTANCE = 2
+C_IS_INDUCER = 3
+C_PREV_SPEED = 4
+CAR_FIELDS = 5
 
 np.random.seed(42)
 
 # =============================================================================
-# NUMBA JIT-COMPILED SIMULATION CORE
+# NUMBA JIT-COMPILED SIMULATION
 # =============================================================================
 
 @njit(cache=True)
-def neural_forward(genome, gap_ratio, front_speed_ratio, own_speed_ratio):
-    """Simple linear neural network without np.dot (Numba compatible)."""
-    # Manual matrix multiplication: 3 inputs -> 2 outputs
-    # Weights: 6 values (3x2), Biases: 2 values
-    w00, w01 = genome[0], genome[1]
-    w10, w11 = genome[2], genome[3]
-    w20, w21 = genome[4], genome[5]
-    b0, b1 = genome[6], genome[7]
+def neural_forward(genome, gap_distance, front_speed, own_speed):
+    """Neural network: decides target speed based on gap and front car speed."""
+    # Normalize inputs to [0, 1] range
+    gap_norm = min(gap_distance / 40.0, 1.5)  # Normalize gap
+    front_norm = front_speed / (BASE_SPEED * 1.5)  # Front car speed
+    own_norm = own_speed / (BASE_SPEED * 1.5)  # Own speed
     
-    # Output 0: speed_mult_raw
-    raw0 = gap_ratio * w00 + front_speed_ratio * w10 + own_speed_ratio * w20 + b0
-    # Output 1: pref_gap_raw
-    raw1 = gap_ratio * w01 + front_speed_ratio * w11 + own_speed_ratio * w21 + b1
+    # Weights
+    w0, w1, w2, b = genome[0], genome[1], genome[2], genome[3]
     
-    # Tanh activation and scale
-    out0 = np.tanh(raw0)
-    out1 = np.tanh(raw1)
+    # Linear + sigmoid for smooth output
+    raw = gap_norm * w0 + front_norm * w1 + own_norm * w2 + b
     
-    # out[0]: speed_mult in [0.9, 1.1]
-    # out[1]: preferred_gap in [8, 40] meters
-    speed_mult = 1.0 + out0 * 0.1  # 0.9 to 1.1
-    pref_gap = 24.0 + out1 * 16.0  # 8 to 40 meters
-    return speed_mult, pref_gap
+    # Sigmoid to [0, 1], then scale to [0.3, 1.3] * BASE_SPEED
+    sigmoid = 1.0 / (1.0 + np.exp(-raw))
+    speed_mult = 0.3 + sigmoid * 1.0  # 0.3 to 1.3
+    
+    return speed_mult * BASE_SPEED
 
 
 @njit(cache=True)
 def run_simulation(genome, seed):
-    """Run a complete simulation and return (total_learner_laps, collision_count)."""
+    """Run simulation and return fitness metrics."""
     np.random.seed(seed)
     
-    # Initialize cars array
+    # Initialize cars
     cars = np.zeros((NUM_CARS, CAR_FIELDS), dtype=np.float64)
-    
-    # Equal spacing around circle
     for i in range(NUM_CARS):
         cars[i, C_ANGLE] = (i / NUM_CARS) * 2 * np.pi
         cars[i, C_SPEED] = BASE_SPEED
-        cars[i, C_TARGET_SPEED] = BASE_SPEED
-        cars[i, C_SPEED_MULT] = 1.0
         cars[i, C_DISTANCE] = 0.0
         cars[i, C_IS_INDUCER] = 1.0 if i == 0 else 0.0
-        cars[i, C_ACCEL_TIMER] = 0.0
-        cars[i, C_PENDING_ACCEL] = 0.0
+        cars[i, C_PREV_SPEED] = BASE_SPEED
     
-    collision_count = 0
     steps = int(SIM_DURATION / DT)
-    inducer_change_timer = 0.0
-    inducer_target_mult = 1.0
+    
+    # Inducer behavior
+    inducer_timer = 0.0
+    inducer_target = 1.0
+    
+    # Metrics
+    collision_count = 0
+    speed_change_sum = 0.0  # Total speed changes (jerking)
+    too_slow_count = 0  # Count of times going < 80% base speed
+    total_speed_ratio = 0.0  # Track average speed relative to base
+    sample_count = 0
     
     for step in range(steps):
-        # === INDUCER BEHAVIOR ===
-        inducer_change_timer += DT
-        if inducer_change_timer > 1.5 + np.random.random() * 2.0:  # Change every 1.5-3.5 seconds (more frequent)
-            inducer_change_timer = 0.0
-            inducer_target_mult = 0.85 + np.random.random() * 0.3  # 0.85 to 1.15 (wider range)
+        # Inducer fluctuates speed MORE to create challenge
+        inducer_timer += DT
+        if inducer_timer > 2.0:  # Change every 2 seconds
+            inducer_timer = 0.0
+            inducer_target = 0.6 + np.random.random() * 0.8  # 0.6 to 1.4 multiplier
         
-        # More aggressive speed transitions (0.2 instead of 0.1)
-        cars[0, C_SPEED_MULT] += (inducer_target_mult - cars[0, C_SPEED_MULT]) * 0.2
-        cars[0, C_TARGET_SPEED] = BASE_SPEED * cars[0, C_SPEED_MULT]
+        # Smooth transition
+        cars[0, C_SPEED] += (inducer_target * BASE_SPEED - cars[0, C_SPEED]) * 0.15
         
-        # === FIND FRONT CAR FOR EACH CAR ===
-        # Sort by angle to determine order
+        # Sort cars by angle
         angles = cars[:, C_ANGLE].copy()
         order = np.argsort(angles)
         
-        # === UPDATE EACH CAR ===
+        # Update each car
         for idx in range(NUM_CARS):
             i = order[idx]
-            
-            # Find front car (next in circular order)
             front_idx = order[(idx + 1) % NUM_CARS]
             
-            # Calculate gap (arc distance to front car)
+            # Calculate gap to front car
             angle_diff = (cars[front_idx, C_ANGLE] - cars[i, C_ANGLE]) % (2 * np.pi)
             gap = angle_diff * CIRCLE_RADIUS
             if gap < 0.1:
-                gap = CIRCUMFERENCE  # Full circle if same position
+                gap = CIRCUMFERENCE
             
-            # === LEARNER DECISION ===
-            if cars[i, C_IS_INDUCER] < 0.5:  # Learner
-                # Normalize inputs
-                gap_ratio = gap / 50.0  # Normalize to ~1 for 50m gap
-                front_speed_ratio = cars[front_idx, C_SPEED] / BASE_SPEED
-                own_speed_ratio = cars[i, C_SPEED] / BASE_SPEED
+            # Learner uses neural network
+            if cars[i, C_IS_INDUCER] < 0.5:
+                target_speed = neural_forward(
+                    genome,
+                    gap,
+                    cars[front_idx, C_SPEED],
+                    cars[i, C_SPEED]
+                )
                 
-                target_mult, pref_gap = neural_forward(genome, gap_ratio, front_speed_ratio, own_speed_ratio)
+                # Smoothly adjust speed (prevent instant changes)
+                speed_diff = target_speed - cars[i, C_SPEED]
+                cars[i, C_SPEED] += speed_diff * 0.3  # Faster adjustment for responsiveness
                 
-                # === COLLISION AVOIDANCE ===
-                if gap < MIN_SAFE_DISTANCE * 2:
-                    # Emergency brake - linear reduction based on gap
-                    target_mult = max(0.5, target_mult * (gap / (MIN_SAFE_DISTANCE * 2)))
+                # Clamp to reasonable range
+                cars[i, C_SPEED] = max(0.5, min(cars[i, C_SPEED], BASE_SPEED * 1.5))
                 
-                # If gap is smaller than preferred, slow down
-                if gap < pref_gap:
-                    gap_factor = gap / pref_gap
-                    target_mult = min(target_mult, front_speed_ratio * gap_factor + 0.1)
+                # Track metrics
+                speed_change = abs(cars[i, C_SPEED] - cars[i, C_PREV_SPEED])
+                speed_change_sum += speed_change
                 
-                # === REACTION DELAY (only for speeding up) ===
-                if target_mult > cars[i, C_SPEED_MULT]:
-                    if cars[i, C_PENDING_ACCEL] < 0.5:
-                        cars[i, C_PENDING_ACCEL] = 1.0
-                        cars[i, C_ACCEL_TIMER] = REACTION_DELAY
-                    
-                    if cars[i, C_ACCEL_TIMER] > 0:
-                        cars[i, C_ACCEL_TIMER] -= DT
-                        target_mult = cars[i, C_SPEED_MULT]  # Can't accelerate yet
-                    else:
-                        cars[i, C_PENDING_ACCEL] = 0.0
-                else:
-                    # Braking is instant
-                    cars[i, C_PENDING_ACCEL] = 0.0
-                    cars[i, C_ACCEL_TIMER] = 0.0
+                # Count slow driving
+                if cars[i, C_SPEED] < BASE_SPEED * 0.8:
+                    too_slow_count += 1
                 
-                # Clamp speed multiplier to 0.9-1.1 range
-                cars[i, C_SPEED_MULT] = max(0.9, min(1.1, target_mult))
+                # Track average speed ratio
+                total_speed_ratio += cars[i, C_SPEED] / BASE_SPEED
+                sample_count += 1
+                
+                cars[i, C_PREV_SPEED] = cars[i, C_SPEED]
             
-            # === APPLY SPEED ===
-            cars[i, C_TARGET_SPEED] = BASE_SPEED * cars[i, C_SPEED_MULT]
-            
-            # Gradual acceleration/deceleration
-            if cars[i, C_SPEED] < cars[i, C_TARGET_SPEED]:
-                cars[i, C_SPEED] = min(cars[i, C_SPEED] + ACCEL_RATE * DT, cars[i, C_TARGET_SPEED])
-            else:
-                cars[i, C_SPEED] = max(cars[i, C_SPEED] - DECEL_RATE * DT, cars[i, C_TARGET_SPEED])
-            
-            cars[i, C_SPEED] = max(0.0, cars[i, C_SPEED])
-            
-            # === MOVE ===
+            # Move car
             dist = cars[i, C_SPEED] * DT
             dtheta = dist / CIRCLE_RADIUS
             cars[i, C_ANGLE] = (cars[i, C_ANGLE] + dtheta) % (2 * np.pi)
             cars[i, C_DISTANCE] += dist
         
-        # === CHECK COLLISIONS ===
+        # Check collisions (< 3m is collision)
         for i in range(NUM_CARS):
             for j in range(i + 1, NUM_CARS):
                 angle_diff = abs(cars[i, C_ANGLE] - cars[j, C_ANGLE])
                 if angle_diff > np.pi:
                     angle_diff = 2 * np.pi - angle_diff
                 arc_dist = angle_diff * CIRCLE_RADIUS
-                if arc_dist < MIN_SAFE_DISTANCE:
+                if arc_dist < 3.0:
                     collision_count += 1
     
-    # Calculate total laps by learners
-    learner_laps = 0.0
+    # Calculate metrics
+    total_distance = 0.0
     for i in range(NUM_CARS):
         if cars[i, C_IS_INDUCER] < 0.5:
-            learner_laps += cars[i, C_DISTANCE] / CIRCUMFERENCE
+            total_distance += cars[i, C_DISTANCE]
     
-    return learner_laps, collision_count
+    learner_laps = total_distance / CIRCUMFERENCE / (NUM_CARS - 1)
+    avg_speed_change = speed_change_sum / sample_count
+    avg_speed_ratio = total_speed_ratio / sample_count
+    slow_ratio = too_slow_count / sample_count
+    
+    return learner_laps, collision_count, avg_speed_change, avg_speed_ratio, slow_ratio
 
+
+# =============================================================================
+# EVALUATION
+# =============================================================================
 
 def create_random_genome():
-    """Create random genome."""
-    return np.random.randn(GENOME_SIZE) * 0.5
+    return np.random.randn(GENOME_SIZE) * 1.0
 
 
 def evaluate_genome(args):
-    """Evaluate a single genome (for multiprocessing)."""
+    """Evaluate genome over multiple runs."""
     genome, base_seed = args
+    
     total_laps = 0.0
     total_collisions = 0
-    n_runs = 3  # Average over 3 runs
+    total_speed_change = 0.0
+    total_speed_ratio = 0.0
+    total_slow_ratio = 0.0
     
+    n_runs = 3
     for i in range(n_runs):
-        laps, collisions = run_simulation(genome, base_seed + i * 1000)
-        total_laps += laps
+        laps, collisions, speed_change, speed_ratio, slow_ratio = run_simulation(
+            genome, base_seed + i * 1000
+        )
+        laps_penalized = max(0.0, laps - collisions * 0.3)
+        total_laps += laps_penalized
         total_collisions += collisions
+        total_speed_change += speed_change
+        total_speed_ratio += speed_ratio
+        total_slow_ratio += slow_ratio
     
     avg_laps = total_laps / n_runs
     avg_collisions = total_collisions / n_runs
+    avg_speed_change = total_speed_change / n_runs
+    avg_speed_ratio = total_speed_ratio / n_runs
+    avg_slow_ratio = total_slow_ratio / n_runs
+
+    # Induce heavy penalty: reduce avg_laps by 0.3 per collision
+    avg_laps_penalized = avg_laps  # Already penalized per sample above
     
-    # Fitness = laps - collision penalty
-    fitness = avg_laps - avg_collisions * 2.0
-    return fitness, genome, avg_laps, avg_collisions
+    # NEW FITNESS FUNCTION:
+    # We want cars to go FAST and SMOOTH while avoiding collisions
+    
+    # Base fitness: reward speed (laps completed)
+    fitness = avg_laps_penalized * 10.0  # Scale up for better resolution
+    
+    # CRITICAL: Massive collision penalty (forces safe driving)
+    fitness -= avg_collisions * 50.0
+    
+    # Tier 1 (0-15 laps): Just avoid collisions
+    # (Already handled by collision penalty)
+    
+    # Tier 2 (15-30 laps): Penalize jerky driving
+    if avg_laps > 15:
+        jerkiness_penalty = avg_speed_change * 200.0  # Heavy penalty for speed changes
+        fitness -= jerkiness_penalty
+    
+    # Tier 3 (30+ laps): Penalize slow driving heavily
+    if avg_laps > 30:
+        # Want speed ratio close to 1.0 (matching base speed)
+        speed_deviation = abs(avg_speed_ratio - 1.0)
+        fitness -= speed_deviation * 50.0
+        
+        # Extra penalty for being too slow
+        if avg_speed_ratio < 0.9:
+            fitness -= (0.9 - avg_speed_ratio) * 100.0
+    
+    return fitness, genome, avg_laps, avg_collisions, avg_speed_change, avg_speed_ratio
 
 
 # =============================================================================
@@ -242,15 +253,12 @@ def crossover(p1, p2):
     """BLX-alpha crossover."""
     child = np.zeros(GENOME_SIZE)
     for i in range(GENOME_SIZE):
-        if np.random.random() < 0.5:
-            alpha = np.random.uniform(-0.1, 1.1)
-            child[i] = alpha * p1[i] + (1 - alpha) * p2[i]
-        else:
-            child[i] = p1[i] if np.random.random() < 0.5 else p2[i]
+        alpha = np.random.uniform(-0.1, 1.1)
+        child[i] = alpha * p1[i] + (1 - alpha) * p2[i]
     return child
 
 
-def mutate(genome, rate=0.2, intensity=0.3):
+def mutate(genome, rate=0.3, intensity=0.5):
     """Gaussian mutation."""
     child = genome.copy()
     for i in range(GENOME_SIZE):
@@ -260,7 +268,7 @@ def mutate(genome, rate=0.2, intensity=0.3):
 
 
 def run_generation(gen_num, population):
-    """Run one generation with multiprocessing."""
+    """Evaluate population in parallel."""
     args_list = [(g, gen_num * 10000 + i) for i, g in enumerate(population)]
     
     results = []
@@ -268,15 +276,14 @@ def run_generation(gen_num, population):
         futures = [executor.submit(evaluate_genome, args) for args in args_list]
         for future in as_completed(futures):
             results.append(future.result())
-
-    # Sort by fitness (higher is better)
+    
     results.sort(reverse=True, key=lambda x: x[0])
     return results
 
 
 def evolve_population(results, pop_size):
     """Create next generation."""
-    elite_count = max(5, pop_size // 7)
+    elite_count = max(5, pop_size // 10)
     elites = [r[1] for r in results[:elite_count]]
     
     new_pop = list(elites)
@@ -285,34 +292,24 @@ def evolve_population(results, pop_size):
     while len(new_pop) < pop_size:
         t_size = 5
         candidates = random.sample(range(len(results)), t_size)
-        p1 = results[min(candidates)][1]  # min index = best fitness (sorted descending)
+        p1 = results[min(candidates)][1]
         candidates = random.sample(range(len(results)), t_size)
-        p2 = results[min(candidates)][1]  # min index = best fitness (sorted descending)
+        p2 = results[min(candidates)][1]
         
         child = crossover(p1, p2)
-        child = mutate(child, rate=0.25, intensity=0.4)  # Higher mutation for exploration
+        child = mutate(child, rate=0.3, intensity=0.5)
         new_pop.append(child)
     
-    # Fresh randoms
-    for i in range(max(2, pop_size // 20)):
+    # Add random genomes
+    for i in range(max(3, pop_size // 15)):
         new_pop[-(i + 1)] = create_random_genome()
     
     return new_pop[:pop_size]
 
 
 # =============================================================================
-# SAMPLE RESULT CLASS (for pickle)
+# VIDEO GENERATION
 # =============================================================================
-
-class SampleResult:
-    def __init__(self, total_laps, learner_laps, car_states, genome, seed, collision_count):
-        self.total_laps = total_laps
-        self.learner_laps = learner_laps
-        self.car_states = car_states
-        self.genome = genome
-        self.seed = seed
-        self.collision_count = collision_count
-
 
 def run_sample_with_recording(genome, seed):
     """Run simulation with frame recording for video."""
@@ -322,42 +319,35 @@ def run_sample_with_recording(genome, seed):
     for i in range(NUM_CARS):
         cars[i, C_ANGLE] = (i / NUM_CARS) * 2 * np.pi
         cars[i, C_SPEED] = BASE_SPEED
-        cars[i, C_TARGET_SPEED] = BASE_SPEED
-        cars[i, C_SPEED_MULT] = 1.0
         cars[i, C_DISTANCE] = 0.0
         cars[i, C_IS_INDUCER] = 1.0 if i == 0 else 0.0
-        cars[i, C_ACCEL_TIMER] = 0.0
-        cars[i, C_PENDING_ACCEL] = 0.0
+        cars[i, C_PREV_SPEED] = BASE_SPEED
     
     frames = []
-    collision_count = 0
     steps = int(SIM_DURATION / DT)
-    inducer_change_timer = 0.0
-    inducer_target_mult = 1.0
+    inducer_timer = 0.0
+    inducer_target = 1.0
     
     for step in range(steps):
-        # Record frame every 4 steps
-        if step % 4 == 0:
-            frame = []
-            for i in range(NUM_CARS):
-                frame.append((
-                    cars[i, C_ANGLE],
-                    cars[i, C_SPEED_MULT],
-                    cars[i, C_SPEED],
-                    cars[i, C_IS_INDUCER] > 0.5,
-                    cars[i, C_DISTANCE] / CIRCUMFERENCE,
-                    False  # collided flag (simplified)
-                ))
-            frames.append(frame)
+        # Record every step (~48 FPS)
+        frame = []
+        for i in range(NUM_CARS):
+            frame.append((
+                cars[i, C_ANGLE],
+                cars[i, C_SPEED] / BASE_SPEED,
+                cars[i, C_SPEED],
+                cars[i, C_IS_INDUCER] > 0.5,
+                cars[i, C_DISTANCE] / CIRCUMFERENCE
+            ))
+        frames.append(frame)
         
-        # Same simulation logic as run_simulation
-        inducer_change_timer += DT
-        if inducer_change_timer > 2.0 + np.random.random() * 3.0:
-            inducer_change_timer = 0.0
-            inducer_target_mult = 0.9 + np.random.random() * 0.3
+        # Inducer behavior (same as simulation)
+        inducer_timer += DT
+        if inducer_timer > 2.0:
+            inducer_timer = 0.0
+            inducer_target = 0.7 + np.random.random() * 0.6
         
-        cars[0, C_SPEED_MULT] += (inducer_target_mult - cars[0, C_SPEED_MULT]) * 0.1
-        cars[0, C_TARGET_SPEED] = BASE_SPEED * cars[0, C_SPEED_MULT]
+        cars[0, C_SPEED] += (inducer_target * BASE_SPEED - cars[0, C_SPEED]) * 0.15
         
         angles = cars[:, C_ANGLE].copy()
         order = np.argsort(angles)
@@ -372,88 +362,48 @@ def run_sample_with_recording(genome, seed):
                 gap = CIRCUMFERENCE
             
             if cars[i, C_IS_INDUCER] < 0.5:
-                gap_ratio = gap / 50.0
-                front_speed_ratio = cars[front_idx, C_SPEED] / BASE_SPEED
-                own_speed_ratio = cars[i, C_SPEED] / BASE_SPEED
+                # Use genome to compute target speed
+                w0, w1, w2, b = genome[0], genome[1], genome[2], genome[3]
+                gap_norm = min(gap / 40.0, 1.5)
+                front_norm = cars[front_idx, C_SPEED] / (BASE_SPEED * 1.5)
+                own_norm = cars[i, C_SPEED] / (BASE_SPEED * 1.5)
                 
-                # Manual neural forward (same as JIT version)
-                w00, w01 = genome[0], genome[1]
-                w10, w11 = genome[2], genome[3]
-                w20, w21 = genome[4], genome[5]
-                b0, b1 = genome[6], genome[7]
+                raw = gap_norm * w0 + front_norm * w1 + own_norm * w2 + b
+                sigmoid = 1.0 / (1.0 + np.exp(-raw))
+                speed_mult = 0.3 + sigmoid * 1.0
+                target_speed = speed_mult * BASE_SPEED
                 
-                raw0 = gap_ratio * w00 + front_speed_ratio * w10 + own_speed_ratio * w20 + b0
-                raw1 = gap_ratio * w01 + front_speed_ratio * w11 + own_speed_ratio * w21 + b1
-                
-                out0 = np.tanh(raw0)
-                out1 = np.tanh(raw1)
-                
-                target_mult = 0.95 + out0 * 0.25
-                pref_gap = 24.0 + out1 * 16.0
-                
-                if gap < MIN_SAFE_DISTANCE * 2:
-                    target_mult = max(0.5, target_mult * (gap / (MIN_SAFE_DISTANCE * 2)))
-                
-                if gap < pref_gap:
-                    gap_factor = gap / pref_gap
-                    target_mult = min(target_mult, front_speed_ratio * gap_factor + 0.1)
-                
-                if target_mult > cars[i, C_SPEED_MULT]:
-                    if cars[i, C_PENDING_ACCEL] < 0.5:
-                        cars[i, C_PENDING_ACCEL] = 1.0
-                        cars[i, C_ACCEL_TIMER] = REACTION_DELAY
-                    
-                    if cars[i, C_ACCEL_TIMER] > 0:
-                        cars[i, C_ACCEL_TIMER] -= DT
-                        target_mult = cars[i, C_SPEED_MULT]
-                    else:
-                        cars[i, C_PENDING_ACCEL] = 0.0
-                else:
-                    cars[i, C_PENDING_ACCEL] = 0.0
-                    cars[i, C_ACCEL_TIMER] = 0.0
-                
-                cars[i, C_SPEED_MULT] = max(0.5, min(1.3, target_mult))
-            
-            cars[i, C_TARGET_SPEED] = BASE_SPEED * cars[i, C_SPEED_MULT]
-            
-            if cars[i, C_SPEED] < cars[i, C_TARGET_SPEED]:
-                cars[i, C_SPEED] = min(cars[i, C_SPEED] + ACCEL_RATE * DT, cars[i, C_TARGET_SPEED])
-            else:
-                cars[i, C_SPEED] = max(cars[i, C_SPEED] - DECEL_RATE * DT, cars[i, C_TARGET_SPEED])
-            
-            cars[i, C_SPEED] = max(0.0, cars[i, C_SPEED])
+                speed_diff = target_speed - cars[i, C_SPEED]
+                cars[i, C_SPEED] += speed_diff * 0.3
+                cars[i, C_SPEED] = max(0.5, min(cars[i, C_SPEED], BASE_SPEED * 1.5))
+                cars[i, C_PREV_SPEED] = cars[i, C_SPEED]
             
             dist = cars[i, C_SPEED] * DT
             dtheta = dist / CIRCLE_RADIUS
             cars[i, C_ANGLE] = (cars[i, C_ANGLE] + dtheta) % (2 * np.pi)
             cars[i, C_DISTANCE] += dist
     
-    learner_laps = sum(cars[i, C_DISTANCE] / CIRCUMFERENCE for i in range(NUM_CARS) if cars[i, C_IS_INDUCER] < 0.5)
-    total_laps = sum(cars[i, C_DISTANCE] / CIRCUMFERENCE for i in range(NUM_CARS))
+    learner_laps = sum(cars[i, C_DISTANCE] / CIRCUMFERENCE 
+                       for i in range(NUM_CARS) if cars[i, C_IS_INDUCER] < 0.5) / (NUM_CARS - 1)
     
-    return SampleResult(total_laps, learner_laps, frames, genome, seed, collision_count)
+    return frames, learner_laps, genome
 
 
-# =============================================================================
-# VIDEO GENERATION
-# =============================================================================
-
-def save_video(sample_result, filename, gen_num=0):
-    """Generate video from sample result."""
-    import matplotlib
-    matplotlib.use('Agg')  # Non-interactive backend
-    import matplotlib.pyplot as plt
-    import imageio.v2 as imageio
-    
-    frames = sample_result.car_states
-    if not frames:
-        print(f"  No frames for {filename}")
+def save_video(frames, filename, gen_num, laps):
+    """Generate video from frames."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import imageio.v2 as imageio
+    except ImportError:
+        print(f"  Skipping video (matplotlib/imageio not installed)")
         return
     
     fig, ax = plt.subplots(figsize=(8, 8), dpi=100)
-    
     images = []
-    for frame_idx, frame in enumerate(frames[::2]):  # Skip every other frame
+    
+    for frame_idx, frame in enumerate(frames):
         ax.clear()
         ax.set_xlim(-CIRCLE_RADIUS - 20, CIRCLE_RADIUS + 20)
         ax.set_ylim(-CIRCLE_RADIUS - 20, CIRCLE_RADIUS + 20)
@@ -461,123 +411,84 @@ def save_video(sample_result, filename, gen_num=0):
         ax.set_aspect('equal')
         ax.axis('off')
         
-        # Draw circle road
+        # Draw road
         circle = plt.Circle((0, 0), CIRCLE_RADIUS, color='#3d3d5c', fill=False, linewidth=8)
         ax.add_patch(circle)
-        
-        # Draw cars
-        for i, (angle, speed_mult, speed, is_inducer, laps, collided) in enumerate(frame):
+
+        # Draw cars as rectangles (car shapes)
+        car_length = 3.5 * CAR_SIZE_RATIO
+        car_width = 1.5 * CAR_SIZE_RATIO
+        for i, (angle, speed_mult, speed, is_inducer, car_laps) in enumerate(frame):
             x = CIRCLE_RADIUS * np.cos(angle)
             y = CIRCLE_RADIUS * np.sin(angle)
-            color = '#ff6b6b' if is_inducer else '#00ff88'
-            if speed < BASE_SPEED * 0.7:
+            theta = angle + np.pi / 2  # Tangent direction
+            if is_inducer:
+                color = '#ff6b6b'  # Red for inducer
+            elif speed < BASE_SPEED * 0.8:
                 color = '#ffaa00'  # Yellow if slow
-            ax.plot(x, y, 'o', color=color, markersize=12)
+            else:
+                color = '#00ff88'  # Green if good speed
+
+            # Rectangle center at (x, y), rotated to match tangent
+            rect = plt.Rectangle(
+                (x - car_length/2 * np.cos(theta),
+                 y - car_length/2 * np.sin(theta)),
+                car_length, car_width,
+                angle=np.degrees(theta),
+                color=color, ec='white', lw=1.5
+            )
+            ax.add_patch(rect)
         
         # Info text
-        t = frame_idx * 2 * DT * 4
-        learner_laps = sum(f[4] for f in frame if not f[3])
-        ax.text(0, CIRCLE_RADIUS + 12, f'Gen {gen_num} | t={t:.1f}s | Learner Laps: {learner_laps:.1f}',
-                ha='center', va='bottom', color='white', fontsize=11, fontweight='bold',
-                transform=ax.transData)
+        t = frame_idx * 4 * DT
+        ax.text(0, CIRCLE_RADIUS + 12, 
+                f'Gen {gen_num} | t={t:.1f}s | Avg Laps: {laps:.1f}',
+                ha='center', va='bottom', color='white', fontsize=12, fontweight='bold')
         
         fig.patch.set_facecolor('#1a1a2e')
         fig.canvas.draw()
         
-        # Get image from canvas
         buf = fig.canvas.buffer_rgba()
         img = np.asarray(buf)[:, :, :3].copy()
         images.append(img)
     
-    imageio.mimsave(filename, images, fps=30)
+    imageio.mimsave(filename, images, fps=25)
     plt.close(fig)
-    print(f"    Saved: {filename}")
+    print(f"    Saved video: {filename}")
 
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
-def load_latest_generation():
-    """Load the latest generation from saved pkl files, or return None if starting fresh."""
-    if not os.path.exists(SAVE_DIR):
-        return None, 0, [], []
-    
-    # Find all gen*_population.pkl files
-    pkl_files = [f for f in os.listdir(SAVE_DIR) if f.startswith('gen') and f.endswith('_population.pkl')]
-    if not pkl_files:
-        return None, 0, [], []
-    
-    # Extract generation numbers and find the latest
-    gen_numbers = []
-    for f in pkl_files:
-        try:
-            gen_num = int(f[3:6])  # Extract gen number from "genXXX_population.pkl"
-            gen_numbers.append(gen_num)
-        except:
-            continue
-    
-    if not gen_numbers:
-        return None, 0, [], []
-    
-    latest_gen = max(gen_numbers)
-    
-    # Load the full population data
-    pkl_path = os.path.join(SAVE_DIR, f'gen{latest_gen:03d}_population.pkl')
-    try:
-        with open(pkl_path, 'rb') as f:
-            pop_data = pickle.load(f)
-            population = pop_data['population']
-            best_fitness_history = pop_data.get('best_fitness_history', [])
-            best_laps_history = pop_data.get('best_laps_history', [])
-            print(f"  Loaded generation {latest_gen} with {len(population)} genomes")
-            return population, latest_gen, best_fitness_history, best_laps_history
-    except Exception as e:
-        print(f"  Warning: Could not load population file: {e}")
-        return None, 0, [], []
-    
-    return None, 0, [], []
-    
-    print(f"  Resuming from generation {latest_gen}")
-    print(f"  Loaded {len([g for g in population if g is not None])} genomes from previous run")
-    
-    return population, latest_gen, best_fitness_history, best_laps_history
-
-
 def main():
-    print("\n" + "=" * 60)
-    print("  CIRCLE ROAD TRAFFIC OPTIMIZATION - V5 (Numba)")
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print("  CIRCLE ROAD TRAFFIC OPTIMIZATION - V6 (Simplified)")
+    print("=" * 70)
     print(f"  Cars: {NUM_CARS} (1 inducer + {NUM_CARS-1} learners)")
-    print(f"  Circle radius: {CIRCLE_RADIUS}m | Duration: {SIM_DURATION}s")
-    print(f"  Samples/gen: {SAMPLES_PER_GEN} | Workers: {MAX_WORKERS}")
-    print(f"  Generations: {NUM_GENERATIONS}")
-    print("=" * 60)
+    print(f"  Circle: {CIRCLE_RADIUS}m radius | Duration: {SIM_DURATION}s")
+    print(f"  Population: {SAMPLES_PER_GEN} | Generations: {NUM_GENERATIONS}")
+    print(f"  Workers: {MAX_WORKERS}")
+    print("=" * 70)
     
     # Warm up JIT
-    print("  JIT compiling...", end=" ", flush=True)
+    print("\n  JIT compiling...", end=" ", flush=True)
     _ = run_simulation(create_random_genome(), 0)
-    print("done!")
-    print("=" * 60 + "\n")
+    print("done!\n")
     
-    if not os.path.exists(SAVE_DIR):
-        os.makedirs(SAVE_DIR)
+    os.makedirs(SAVE_DIR, exist_ok=True)
     
-    # Try to load from previous run
-    population, start_gen, best_fitness_history, best_laps_history = load_latest_generation()
-    if population is None:
-        population = [create_random_genome() for _ in range(SAMPLES_PER_GEN)]
-        start_gen = 0
-        best_fitness_history = []
-        best_laps_history = []
+    # Initialize
+    population = [create_random_genome() for _ in range(SAMPLES_PER_GEN)]
+    best_fitness_history = []
+    best_laps_history = []
     
-    for gen in range(start_gen + 1, start_gen + NUM_GENERATIONS + 1):
+    for gen in range(1, NUM_GENERATIONS + 1):
         t0 = timer.time()
         
         results = run_generation(gen, population)
         
-        best_fitness, best_genome, best_laps, best_collisions = results[0]
-        avg_fitness = np.mean([r[0] for r in results])
+        best_fitness, best_genome, best_laps, best_collisions, best_smoothness, best_speed = results[0]
         avg_laps = np.mean([r[2] for r in results])
         
         best_fitness_history.append(best_fitness)
@@ -585,73 +496,42 @@ def main():
         
         dt = timer.time() - t0
         
-        print(f"  Gen {gen:3d}/{start_gen + NUM_GENERATIONS} | {dt:4.1f}s | Best: {best_laps:.1f} laps ({best_collisions:.0f} col) | Avg: {avg_laps:.1f} laps")
+        print(f"  Gen {gen:3d} | {dt:4.1f}s | "
+              f"Best: {best_laps:5.1f} laps, {best_collisions:4.0f} col, "
+              f"jerk={best_smoothness:.4f}, speed={best_speed:.2f}x | Avg: {avg_laps:5.1f} laps")
         
-        # Delete old pkl files from previous generation to save space
-        if gen > 1:
-            old_gen = gen - 1
-            # Delete all files from previous gen except if it's a milestone (every 10)
-            if old_gen % 10 != 0:
-                for old_file in os.listdir(SAVE_DIR):
-                    if old_file.startswith(f'gen{old_gen:03d}') and old_file.endswith('.pkl'):
-                        try:
-                            os.remove(os.path.join(SAVE_DIR, old_file))
-                        except:
-                            pass
-            else:
-                # Even for milestones, delete population pkl to save space (keep only best)
-                pop_file = os.path.join(SAVE_DIR, f'gen{old_gen:03d}_population.pkl')
-                if os.path.exists(pop_file):
-                    try:
-                        os.remove(pop_file)
-                    except:
-                        pass
-        
-        # Save best
-        best_result = run_sample_with_recording(best_genome, gen * 10000)
+        # Save best genome
         with open(os.path.join(SAVE_DIR, f"gen{gen:03d}_best.pkl"), "wb") as f:
-            pickle.dump(best_result, f)
+            pickle.dump({
+                'genome': best_genome,
+                'laps': best_laps,
+                'collisions': best_collisions,
+                'generation': gen
+            }, f)
         
-        # Save entire population for proper resumption (genomes only, not results)
-        pop_data = {
-            'generation': gen,
-            'population': [r[1] for r in results],  # Just the genomes, not full results
-            'best_fitness_history': best_fitness_history,
-            'best_laps_history': best_laps_history
-        }
-        with open(os.path.join(SAVE_DIR, f"gen{gen:03d}_population.pkl"), "wb") as f:
-            pickle.dump(pop_data, f)
-        
-        # Save video every 10 generations or last gen
-        if gen % 10 == 0 or gen == start_gen + NUM_GENERATIONS:
-            vid_name = os.path.join(SAVE_DIR, f"gen{gen:03d}_best.mp4")
-            save_video(best_result, vid_name, gen)
-        
-        # Save top 15 from last gen
-        if gen == start_gen + NUM_GENERATIONS:
-            for i in range(min(15, len(results))):
-                genome = results[i][1]
-                result = run_sample_with_recording(genome, gen * 10000 + i)
-                with open(os.path.join(SAVE_DIR, f"gen{gen:03d}_top{i+1:02d}.pkl"), "wb") as f:
-                    pickle.dump(result, f)
+        # Generate videos for gen 1 and gen 50
+        if gen == 1 or gen == NUM_GENERATIONS:
+            print(f"  Recording gen {gen} video...")
+            frames, laps, genome = run_sample_with_recording(best_genome, gen * 10000)
+            vid_path = os.path.join(SAVE_DIR, f"gen{gen:03d}_best.mp4")
+            save_video(frames, vid_path, gen, laps)
         
         # Evolve
         population = evolve_population(results, SAMPLES_PER_GEN)
     
-    # Summary
-    print("\n" + "=" * 60)
-    print("  OPTIMIZATION COMPLETE")
-    print("=" * 60)
-    if len(best_laps_history) > 0:
-        print(f"  Gen {start_gen + 1} best laps: {best_laps_history[0]:.1f}")
-        print(f"  Gen {start_gen + NUM_GENERATIONS} best laps: {best_laps_history[-1]:.1f}")
-        improvement = best_laps_history[-1] - best_laps_history[0]
-        print(f"  Improvement: {improvement:+.1f} laps")
-    print(f"  Results saved in: {SAVE_DIR}")
-    print("=" * 60 + "\n")
+    # Save history
+    with open(os.path.join(SAVE_DIR, "history.pkl"), "wb") as f:
+        pickle.dump({
+            'best_fitness': best_fitness_history,
+            'best_laps': best_laps_history
+        }, f)
     
-    with open(os.path.join(SAVE_DIR, "fitness_history.pkl"), "wb") as f:
-        pickle.dump({'best_fitness': best_fitness_history, 'best_laps': best_laps_history}, f)
+    print("\n" + "=" * 70)
+    print("  COMPLETE!")
+    print(f"  Gen 1:  {best_laps_history[0]:.1f} laps")
+    print(f"  Gen {NUM_GENERATIONS}: {best_laps_history[-1]:.1f} laps")
+    print(f"  Improvement: {best_laps_history[-1] - best_laps_history[0]:+.1f} laps")
+    print("=" * 70 + "\n")
 
 
 if __name__ == "__main__":
